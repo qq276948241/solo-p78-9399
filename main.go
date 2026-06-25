@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"sort"
 	"time"
@@ -72,6 +73,7 @@ type Enemy struct {
 	Symbol        rune
 	ArmorReduction float64
 	Alive         bool
+	Debuffs       []Effect
 }
 
 type Tower struct {
@@ -86,6 +88,7 @@ type Tower struct {
 	SlowAmount   float64
 	SlowDuration float64
 	TotalCost    int
+	CritCount    int
 }
 
 type Projectile struct {
@@ -100,6 +103,9 @@ type Projectile struct {
 	SlowAmount float64
 	SlowDuration float64
 	Alive    bool
+	SourceTower *Tower
+	IsCrit   bool
+	SourceLevel int
 }
 
 type HighScore struct {
@@ -140,6 +146,8 @@ var (
 	lastTime        time.Time
 	highScores      []HighScore
 	scoreFile       = "highscores.json"
+	critMsg         string
+	critMsgTimer    float64
 )
 
 func initMaps() {
@@ -447,6 +455,8 @@ func startGame(mapIdx int) {
 	cursorY = 1
 	selectedTowerType = TowerSniper
 	lastTime = time.Now()
+	critMsg = ""
+	critMsgTimer = 0
 	state = StatePlaying
 }
 
@@ -516,14 +526,30 @@ func sellTower(t *Tower) {
 func fireTower(t *Tower, target *Enemy) {
 	tx, ty := float64(t.X), float64(t.Y)
 	ex, ey := getEnemyPos(target)
+
+	dmg := t.Damage
+	isCrit := false
+	if t.Type == TowerSniper {
+		if tryCrit(t) {
+			dmg *= 2
+			isCrit = true
+			t.CritCount++
+			critMsg = fmt.Sprintf("暴击! %s 对目标造成 %d 伤害!", getTowerName(t.Type), dmg)
+			critMsgTimer = 2.0
+		}
+	}
+
 	proj := &Projectile{
 		X: tx, Y: ty, TargetX: ex, TargetY: ey,
-		Target: target, Damage: t.Damage, Speed: 15.0,
+		Target: target, Damage: dmg, Speed: 15.0,
 		IsSplash: t.Type == TowerSplash,
 		SplashRadius: t.SplashRadius,
 		IsSlow: t.Type == TowerSlow,
 		SlowAmount: t.SlowAmount, SlowDuration: t.SlowDuration,
 		Alive: true,
+		SourceTower: t,
+		IsCrit: isCrit,
+		SourceLevel: t.Level,
 	}
 	projectiles = append(projectiles, proj)
 }
@@ -588,12 +614,7 @@ func update(dt float64) {
 		if !e.Alive {
 			continue
 		}
-		if e.SlowTimer > 0 {
-			e.SlowTimer -= dt
-			if e.SlowTimer <= 0 {
-				e.Speed = e.BaseSpeed
-			}
-		}
+		updateEffects(e, dt)
 		moveAmt := e.Speed * dt
 		for moveAmt > 0 && e.Alive {
 			if e.PathIndex >= len(currentMap.Path)-1 {
@@ -640,6 +661,7 @@ func update(dt float64) {
 		moveAmt := p.Speed * dt
 		if dist <= moveAmt {
 			if p.IsSplash {
+				burnDps := 2.0 + float64(p.SourceLevel-1)*1.0
 				for _, e := range enemies {
 					if !e.Alive {
 						continue
@@ -647,19 +669,36 @@ func update(dt float64) {
 					ex, ey := getEnemyPos(e)
 					if distance(p.TargetX, p.TargetY, ex, ey) <= p.SplashRadius {
 						dealDamage(e, p.Damage)
+						addDebuff(e, newBurnEffect(burnDps, 3.0))
 					}
 				}
 			} else if p.Target != nil && p.Target.Alive {
 				dealDamage(p.Target, p.Damage)
 				if p.IsSlow {
-					p.Target.SlowTimer = p.SlowDuration
-					p.Target.Speed = p.Target.BaseSpeed * (1.0 - p.SlowAmount)
+					addDebuff(p.Target, newSlowEffect(p.SlowAmount, p.SlowDuration))
+					tex, tey := getEnemyPos(p.Target)
+					for _, e := range enemies {
+						if !e.Alive || e == p.Target {
+							continue
+						}
+						eex, eey := getEnemyPos(e)
+						if distance(tex, tey, eex, eey) <= 1.5 {
+							addDebuff(e, newSlowEffect(0.5, 1.0))
+						}
+					}
 				}
 			}
 			p.Alive = false
 		} else {
 			p.X += (dx / dist) * moveAmt
 			p.Y += (dy / dist) * moveAmt
+		}
+	}
+
+	if critMsgTimer > 0 {
+		critMsgTimer -= dt
+		if critMsgTimer <= 0 {
+			critMsg = ""
 		}
 	}
 
@@ -817,14 +856,34 @@ func drawHUD(offsetX, offsetY, screenW int) {
 		screen.SetContent(offsetX+i, y2, ' ', nil, tcell.StyleDefault.Background(tcell.ColorBlack))
 	}
 	drawText(offsetX, y2, keysStr, keyColor, tcell.ColorBlack)
+
+	y3 := offsetY + 3
+	debuffTotal := countActiveDebuffs()
+	effectStr := fmt.Sprintf(" 场上Debuff: %d ", debuffTotal)
+	if selectedTower != nil && selectedTower.Type == TowerSniper {
+		effectStr += fmt.Sprintf(" | %s暴击次数: %d ", getTowerName(selectedTower.Type), selectedTower.CritCount)
+		critChance := 0.05 + float64(selectedTower.Level-1)*0.05
+		effectStr += fmt.Sprintf("暴击率: %.0f%% ", critChance*100)
+	}
+	if selectedTower != nil && selectedTower.Type == TowerSplash {
+		burnDps := 2 + (selectedTower.Level-1)*1
+		effectStr += fmt.Sprintf(" | %s燃烧: %d/s持续3秒 ", getTowerName(selectedTower.Type), burnDps)
+	}
+	if selectedTower != nil && selectedTower.Type == TowerSlow {
+		effectStr += fmt.Sprintf(" | %s连锁减速: 周围1格50%%1秒 ", getTowerName(selectedTower.Type))
+	}
+	for i := 0; i < screenW; i++ {
+		screen.SetContent(offsetX+i, y3, ' ', nil, tcell.StyleDefault.Background(tcell.ColorBlack))
+	}
+	drawText(offsetX, y3, effectStr, tcell.ColorWhite, tcell.ColorBlack)
 }
 
 func drawGame() {
 	screenW, screenH := screen.Size()
 	mapOffsetX := (screenW - currentMap.Width) / 2
 	mapOffsetY := (screenH - currentMap.Height) / 2
-	if mapOffsetY < 6 {
-		mapOffsetY = 6
+	if mapOffsetY < 7 {
+		mapOffsetY = 7
 	}
 
 	drawHUD(0, 1, screenW)
@@ -895,8 +954,20 @@ func drawGame() {
 		if absX >= 0 && absX < screenW && absY >= 0 && absY < screenH {
 			color := e.Color
 			style := tcell.StyleDefault.Foreground(color).Bold(true)
-			if e.SlowTimer > 0 {
+			burning := hasBurnDebuff(e)
+			hasSlow := false
+			for _, eff := range e.Debuffs {
+				if eff.Type == EffectSlow && eff.Remaining > 0 {
+					hasSlow = true
+					break
+				}
+			}
+			if hasSlow && burning {
+				style = style.Background(tcell.ColorRed)
+			} else if hasSlow {
 				style = style.Background(tcell.ColorBlue)
+			} else if burning {
+				style = style.Background(tcell.ColorRed)
 			}
 			screen.SetContent(absX, absY, e.Symbol, nil, style)
 
@@ -978,6 +1049,18 @@ func drawGame() {
 			x = 0
 		}
 		drawText(x, infoY, info, tcell.ColorWhite, tcell.ColorRed)
+	}
+
+	if critMsgTimer > 0 && critMsg != "" {
+		critY := mapOffsetY + currentMap.Height + 2
+		if selectedTower != nil {
+			critY++
+		}
+		x := (screenW - len(critMsg)) / 2
+		if x < 0 {
+			x = 0
+		}
+		drawText(x, critY, critMsg, tcell.ColorYellow, tcell.ColorRed)
 	}
 }
 
@@ -1403,6 +1486,7 @@ func main() {
 
 	initMaps()
 	loadHighScores()
+	rand.Seed(time.Now().UnixNano())
 	state = StateMenu
 
 	lastTime = time.Now()
