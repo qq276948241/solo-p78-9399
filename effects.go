@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 )
 
@@ -15,8 +16,8 @@ const (
 type Effect struct {
 	Type        EffectType
 	Remaining   float64
-	Value       float64
-	SourceLevel int
+	Value       float64 // 效果数值（燃烧=每秒伤害，减速=减速百分比）
+	SourceLevel int     // 挂上时的塔等级 — 数值已按该等级算好存入 Value，每帧不再重算
 }
 
 type CritResult struct {
@@ -33,10 +34,12 @@ func RollCrit(level int) bool {
 }
 
 func NewBurnEffect(dps float64, duration float64, sourceLevel int) Effect {
+	// dps 已按当前塔等级算好（SplashBurnDPS(sourceLevel)），直接存 Value
 	return Effect{Type: EffectBurn, Remaining: duration, Value: dps, SourceLevel: sourceLevel}
 }
 
 func NewSlowEffect(amount float64, duration float64, sourceLevel int) Effect {
+	// amount 已按当前塔等级算好（tower.SlowAmount 或连锁减速的 0.5），直接存 Value
 	return Effect{Type: EffectSlow, Remaining: duration, Value: amount, SourceLevel: sourceLevel}
 }
 
@@ -65,6 +68,7 @@ func MaxSlowAmount(e *Enemy) float64 {
 
 func ApplyEffect(tower *Tower, target *Enemy, baseDamage int) CritResult {
 	cr := CritResult{IsCrit: false, Damage: baseDamage}
+	// 伤害计算顺序：先算暴击倍率（×2 或 ×1），再传给 DealDamage 算护甲减伤
 	if tower.Type == TowerSniper && RollCrit(tower.Level) {
 		cr.IsCrit = true
 		cr.Damage = baseDamage * 2
@@ -124,20 +128,14 @@ func AddEffect(e *Enemy, eff Effect) {
 	if !e.Alive {
 		return
 	}
+	// 同类效果总是刷新到最新状态（确保塔升级后再次命中会更新数值和持续时间）
+	// 效果数值已在 NewXxxEffect 时按当时塔等级算好存入 eff.Value，这里不再重算
 	for i, existing := range e.Effects {
 		if existing.Type == eff.Type {
-			if eff.Type == EffectBurn && eff.Value > existing.Value {
-				e.Effects[i].Value = eff.Value
-				e.Effects[i].Remaining = eff.Remaining
-				e.Effects[i].SourceLevel = eff.SourceLevel
-				return
-			}
-			if eff.Type == EffectSlow && eff.Remaining > existing.Remaining {
-				e.Effects[i].Value = eff.Value
-				e.Effects[i].Remaining = eff.Remaining
-				e.Effects[i].SourceLevel = eff.SourceLevel
-				return
-			}
+			e.Effects[i].Value = eff.Value
+			e.Effects[i].Remaining = eff.Remaining
+			e.Effects[i].SourceLevel = eff.SourceLevel
+			return
 		}
 	}
 	e.Effects = append(e.Effects, eff)
@@ -161,6 +159,7 @@ func UpdateEffects(e *Enemy, dt float64) {
 }
 
 func ApplyBurnTick(e *Enemy, eff *Effect, dt float64) {
+	// eff.Value 是 debuff 挂上时算好存进去的 dps，每帧直接使用，不重新计算
 	burnDmg := int(eff.Value * dt)
 	if burnDmg < 1 {
 		if rand.Float64() < eff.Value*dt {
@@ -197,11 +196,19 @@ func CountActiveEffects() int {
 }
 
 func DealDamage(e *Enemy, dmg int) {
-	if !e.Alive {
+	if !e.Alive || dmg <= 0 {
 		return
 	}
-	actualDmg := float64(dmg) * (1.0 - e.ArmorReduction)
-	e.HP -= int(actualDmg)
+	// 伤害计算顺序（重要！）：
+	// 1. 先算暴击倍率（已在调用方 ApplyEffect 处理：baseDamage * 2 或 *1）
+	// 2. 再算护甲减伤：伤害 * (1 - ArmorReduction)
+	// 3. 四舍五入取整，最少 1 点伤害（避免小伤害被截断成 0）
+	reduced := float64(dmg) * (1.0 - e.ArmorReduction)
+	actualDmg := int(math.Round(reduced))
+	if actualDmg < 1 {
+		actualDmg = 1
+	}
+	e.HP -= actualDmg
 	if e.HP <= 0 {
 		e.Alive = false
 		gold += e.Reward
