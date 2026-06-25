@@ -67,13 +67,12 @@ type Enemy struct {
 	MaxHP         int
 	Speed         float64
 	BaseSpeed     float64
-	SlowTimer     float64
 	Reward        int
 	Color         tcell.Color
 	Symbol        rune
 	ArmorReduction float64
 	Alive         bool
-	Debuffs       []Effect
+	Effects       []Effect
 }
 
 type Tower struct {
@@ -104,8 +103,6 @@ type Projectile struct {
 	SlowDuration float64
 	Alive    bool
 	SourceTower *Tower
-	IsCrit   bool
-	SourceLevel int
 }
 
 type HighScore struct {
@@ -527,29 +524,15 @@ func fireTower(t *Tower, target *Enemy) {
 	tx, ty := float64(t.X), float64(t.Y)
 	ex, ey := getEnemyPos(target)
 
-	dmg := t.Damage
-	isCrit := false
-	if t.Type == TowerSniper {
-		if tryCrit(t) {
-			dmg *= 2
-			isCrit = true
-			t.CritCount++
-			critMsg = fmt.Sprintf("暴击! %s 对目标造成 %d 伤害!", getTowerName(t.Type), dmg)
-			critMsgTimer = 2.0
-		}
-	}
-
 	proj := &Projectile{
 		X: tx, Y: ty, TargetX: ex, TargetY: ey,
-		Target: target, Damage: dmg, Speed: 15.0,
+		Target: target, Damage: t.Damage, Speed: 15.0,
 		IsSplash: t.Type == TowerSplash,
 		SplashRadius: t.SplashRadius,
 		IsSlow: t.Type == TowerSlow,
 		SlowAmount: t.SlowAmount, SlowDuration: t.SlowDuration,
 		Alive: true,
 		SourceTower: t,
-		IsCrit: isCrit,
-		SourceLevel: t.Level,
 	}
 	projectiles = append(projectiles, proj)
 }
@@ -572,6 +555,42 @@ func findTargetForTower(t *Tower) *Enemy {
 		}
 	}
 	return best
+}
+
+func moveEnemy(e *Enemy, dt float64) {
+	moveAmt := e.Speed * dt
+	for moveAmt > 0 && e.Alive {
+		if e.PathIndex >= len(currentMap.Path)-1 {
+			playerHP -= 10
+			e.Alive = false
+			if playerHP <= 0 {
+				endGame(false)
+			}
+			break
+		}
+		if moveAmt >= 1.0-e.Progress {
+			moveAmt -= (1.0 - e.Progress)
+			e.PathIndex++
+			e.Progress = 0
+		} else {
+			e.Progress += moveAmt
+			moveAmt = 0
+		}
+	}
+}
+
+func resolveProjectileHit(p *Projectile) {
+	if p.SourceTower == nil {
+		return
+	}
+	if p.IsSplash {
+		ApplySplashAt(p.SourceTower, p.TargetX, p.TargetY)
+		return
+	}
+	if p.Target == nil || !p.Target.Alive {
+		return
+	}
+	ApplyEffect(p.SourceTower, p.Target, p.Damage)
 }
 
 func update(dt float64) {
@@ -614,27 +633,8 @@ func update(dt float64) {
 		if !e.Alive {
 			continue
 		}
-		updateEffects(e, dt)
-		moveAmt := e.Speed * dt
-		for moveAmt > 0 && e.Alive {
-			if e.PathIndex >= len(currentMap.Path)-1 {
-				playerHP -= 10
-				e.Alive = false
-				if playerHP <= 0 {
-					endGame(false)
-					return
-				}
-				break
-			}
-			if moveAmt >= 1.0-e.Progress {
-				moveAmt -= (1.0 - e.Progress)
-				e.PathIndex++
-				e.Progress = 0
-			} else {
-				e.Progress += moveAmt
-				moveAmt = 0
-			}
-		}
+		UpdateEffects(e, dt)
+		moveEnemy(e, dt)
 	}
 
 	for _, t := range towers {
@@ -660,34 +660,7 @@ func update(dt float64) {
 		dist := math.Sqrt(dx*dx + dy*dy)
 		moveAmt := p.Speed * dt
 		if dist <= moveAmt {
-			if p.IsSplash {
-				burnDps := 2.0 + float64(p.SourceLevel-1)*1.0
-				for _, e := range enemies {
-					if !e.Alive {
-						continue
-					}
-					ex, ey := getEnemyPos(e)
-					if distance(p.TargetX, p.TargetY, ex, ey) <= p.SplashRadius {
-						dealDamage(e, p.Damage)
-						addDebuff(e, newBurnEffect(burnDps, 3.0))
-					}
-				}
-			} else if p.Target != nil && p.Target.Alive {
-				dealDamage(p.Target, p.Damage)
-				if p.IsSlow {
-					addDebuff(p.Target, newSlowEffect(p.SlowAmount, p.SlowDuration))
-					tex, tey := getEnemyPos(p.Target)
-					for _, e := range enemies {
-						if !e.Alive || e == p.Target {
-							continue
-						}
-						eex, eey := getEnemyPos(e)
-						if distance(tex, tey, eex, eey) <= 1.5 {
-							addDebuff(e, newSlowEffect(0.5, 1.0))
-						}
-					}
-				}
-			}
+			resolveProjectileHit(p)
 			p.Alive = false
 		} else {
 			p.X += (dx / dist) * moveAmt
@@ -704,17 +677,6 @@ func update(dt float64) {
 
 	enemies = filterAliveEnemies(enemies)
 	projectiles = filterAliveProjectiles(projectiles)
-}
-
-func dealDamage(e *Enemy, dmg int) {
-	actualDmg := float64(dmg) * (1.0 - e.ArmorReduction)
-	e.HP -= int(actualDmg)
-	if e.HP <= 0 {
-		e.Alive = false
-		gold += e.Reward
-		totalGoldEarned += e.Reward
-		kills++
-	}
 }
 
 func filterAliveEnemies(arr []*Enemy) []*Enemy {
@@ -858,15 +820,15 @@ func drawHUD(offsetX, offsetY, screenW int) {
 	drawText(offsetX, y2, keysStr, keyColor, tcell.ColorBlack)
 
 	y3 := offsetY + 3
-	debuffTotal := countActiveDebuffs()
+	debuffTotal := CountActiveEffects()
 	effectStr := fmt.Sprintf(" 场上Debuff: %d ", debuffTotal)
 	if selectedTower != nil && selectedTower.Type == TowerSniper {
 		effectStr += fmt.Sprintf(" | %s暴击次数: %d ", getTowerName(selectedTower.Type), selectedTower.CritCount)
-		critChance := 0.05 + float64(selectedTower.Level-1)*0.05
+		critChance := CritChance(selectedTower.Level)
 		effectStr += fmt.Sprintf("暴击率: %.0f%% ", critChance*100)
 	}
 	if selectedTower != nil && selectedTower.Type == TowerSplash {
-		burnDps := 2 + (selectedTower.Level-1)*1
+		burnDps := int(SplashBurnDPS(selectedTower.Level))
 		effectStr += fmt.Sprintf(" | %s燃烧: %d/s持续3秒 ", getTowerName(selectedTower.Type), burnDps)
 	}
 	if selectedTower != nil && selectedTower.Type == TowerSlow {
@@ -954,14 +916,8 @@ func drawGame() {
 		if absX >= 0 && absX < screenW && absY >= 0 && absY < screenH {
 			color := e.Color
 			style := tcell.StyleDefault.Foreground(color).Bold(true)
-			burning := hasBurnDebuff(e)
-			hasSlow := false
-			for _, eff := range e.Debuffs {
-				if eff.Type == EffectSlow && eff.Remaining > 0 {
-					hasSlow = true
-					break
-				}
-			}
+			burning := HasEffect(e, EffectBurn)
+			hasSlow := HasEffect(e, EffectSlow)
 			if hasSlow && burning {
 				style = style.Background(tcell.ColorRed)
 			} else if hasSlow {
